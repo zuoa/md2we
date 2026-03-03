@@ -24,10 +24,15 @@ import urllib.parse
 import urllib.request
 import ssl
 import os
+import threading
 import tempfile
 import uuid
+import copy
+import time
+import socket
 from pathlib import Path
 from datetime import datetime, timezone
+from http.client import RemoteDisconnected
 from urllib.error import HTTPError, URLError
 
 try:
@@ -94,6 +99,11 @@ UPLOAD_IMAGE_ALLOWED_MIME_TYPES = {
     "image/webp",
     "image/gif"
 }
+ILLUSTRATION_JOB_TTL_SECONDS = 60 * 60
+_ILLUSTRATION_JOBS = {}
+_ILLUSTRATION_JOBS_LOCK = threading.Lock()
+AI_REQUEST_MAX_ATTEMPTS = 3
+AI_REQUEST_RETRY_BACKOFF_SECONDS = 2
 
 
 def configure_app_logging():
@@ -116,6 +126,142 @@ def configure_app_logging():
 
 
 configure_app_logging()
+
+
+def get_utc_timestamp():
+    """返回当前 UTC 时间戳。"""
+    return time.time()
+
+
+def get_utc_iso_timestamp():
+    """返回当前 UTC ISO 时间。"""
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def cleanup_illustration_jobs():
+    """清理过期的一键配图任务。"""
+    now = get_utc_timestamp()
+    expired_job_ids = []
+
+    with _ILLUSTRATION_JOBS_LOCK:
+        for job_id, job in _ILLUSTRATION_JOBS.items():
+            updated_at_ts = float(job.get("updated_at_ts") or 0)
+            if now - updated_at_ts > ILLUSTRATION_JOB_TTL_SECONDS:
+                expired_job_ids.append(job_id)
+
+        for job_id in expired_job_ids:
+            _ILLUSTRATION_JOBS.pop(job_id, None)
+
+
+def create_illustration_job(style_key, public_base_url):
+    """创建一键配图后台任务。"""
+    cleanup_illustration_jobs()
+    now_iso = get_utc_iso_timestamp()
+    now_ts = get_utc_timestamp()
+    job_id = uuid.uuid4().hex
+    normalized_style_key, style_config = normalize_article_illustration_style(style_key)
+    job = {
+        "job_id": job_id,
+        "status": "queued",
+        "stage": "queued",
+        "message": "任务已创建，等待开始。",
+        "progress_percent": 0,
+        "completed_segments": 0,
+        "total_segments": 0,
+        "segments": [],
+        "markdown": "",
+        "style": {
+            "key": normalized_style_key,
+            "label": style_config["label"]
+        },
+        "error": "",
+        "created_at": now_iso,
+        "updated_at": now_iso,
+        "updated_at_ts": now_ts,
+        "public_base_url": public_base_url
+    }
+    with _ILLUSTRATION_JOBS_LOCK:
+        _ILLUSTRATION_JOBS[job_id] = job
+    return copy.deepcopy(job)
+
+
+def update_illustration_job(job_id, **changes):
+    """更新一键配图任务状态。"""
+    cleanup_illustration_jobs()
+    with _ILLUSTRATION_JOBS_LOCK:
+        job = _ILLUSTRATION_JOBS.get(job_id)
+        if not job:
+            return None
+
+        for key, value in changes.items():
+            if value is not None:
+                job[key] = value
+
+        job["updated_at"] = get_utc_iso_timestamp()
+        job["updated_at_ts"] = get_utc_timestamp()
+        return copy.deepcopy(job)
+
+
+def get_illustration_job(job_id):
+    """读取一键配图任务。"""
+    cleanup_illustration_jobs()
+    with _ILLUSTRATION_JOBS_LOCK:
+        job = _ILLUSTRATION_JOBS.get(job_id)
+        if not job:
+            return None
+        return copy.deepcopy(job)
+
+
+def serialize_illustration_job(job):
+    """输出前端可消费的任务信息。"""
+    if not job:
+        return None
+
+    payload = copy.deepcopy(job)
+    payload.pop("updated_at_ts", None)
+    payload.pop("public_base_url", None)
+    return payload
+
+
+def get_ai_retry_delay(attempt_index):
+    """返回 AI 请求重试前的退避秒数。"""
+    return AI_REQUEST_RETRY_BACKOFF_SECONDS * max(1, attempt_index)
+
+
+def is_retryable_http_status(status_code):
+    """判断 HTTP 状态码是否适合自动重试。"""
+    return status_code in {408, 409, 425, 429, 500, 502, 503, 504}
+
+
+def is_retryable_ai_exception(exc):
+    """判断 AI 请求异常是否适合自动重试。"""
+    if isinstance(exc, (URLError, TimeoutError, socket.timeout, ConnectionResetError, ConnectionAbortedError, BrokenPipeError, RemoteDisconnected)):
+        return True
+
+    message = str(exc or "").strip().lower()
+    retryable_markers = (
+        "server disconnected without sending a response",
+        "remote end closed connection without response",
+        "connection reset by peer",
+        "connection aborted",
+        "temporarily unavailable",
+        "timed out",
+        "timeout",
+        "eof",
+        "502 bad gateway",
+        "503 service unavailable",
+        "504 gateway timeout"
+    )
+    return any(marker in message for marker in retryable_markers)
+
+
+def normalize_ai_exception_message(exc, capability="text", attempts=1):
+    """把底层网络错误转换成更清晰的中文消息。"""
+    raw_message = str(exc or "").strip()
+    if is_retryable_ai_exception(exc):
+        capability_label = "图片服务" if capability == "image" else "文本服务"
+        return f"AI {capability_label}连接中断，已自动重试 {attempts} 次仍未成功，请稍后重试"
+    return raw_message or "AI 请求失败"
 
 
 class AIConfigCryptoError(ValueError):
@@ -1189,9 +1335,10 @@ def get_public_base_url():
     return request.url_root.rstrip("/")
 
 
-def build_public_url(endpoint, **values):
+def build_public_url(endpoint, public_base_url=None, **values):
     """生成面向搜索引擎和分享卡片的绝对地址。"""
-    return f"{get_public_base_url()}{url_for(endpoint, _external=False, **values)}"
+    base_url = (public_base_url or get_public_base_url()).rstrip("/")
+    return f"{base_url}{url_for(endpoint, _external=False, **values)}"
 
 
 def get_default_og_image_url():
@@ -2017,39 +2164,67 @@ def openai_api_request(path, payload, timeout=60, ai_config=None, capability="te
     }
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
 
-    try:
-        with urllib.request.urlopen(req, timeout=timeout, context=ssl.create_default_context()) as response:
-            response_json = json.loads(response.read().decode("utf-8"))
-            app.logger.info(
-                "AI request completed capability=%s path=%s",
-                capability,
-                path
-            )
-            return response_json
-    except HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="ignore")
-        message = body
+    for attempt in range(1, AI_REQUEST_MAX_ATTEMPTS + 1):
         try:
-            error_data = json.loads(body)
-            message = error_data.get("error", {}).get("message") or body
-        except json.JSONDecodeError:
-            pass
-        app.logger.error(
-            "AI request failed capability=%s path=%s status=%s message=%s",
-            capability,
-            path,
-            exc.code,
-            summarize_log_text(message, limit=240)
-        )
-        raise RuntimeError(f"OpenAI 请求失败: {message}") from exc
-    except URLError as exc:
-        app.logger.error(
-            "AI network request failed capability=%s path=%s reason=%s",
-            capability,
-            path,
-            exc.reason
-        )
-        raise RuntimeError(f"OpenAI 网络请求失败: {exc.reason}") from exc
+            with urllib.request.urlopen(req, timeout=timeout, context=ssl.create_default_context()) as response:
+                response_json = json.loads(response.read().decode("utf-8"))
+                app.logger.info(
+                    "AI request completed capability=%s path=%s attempt=%s",
+                    capability,
+                    path,
+                    attempt
+                )
+                return response_json
+        except HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="ignore")
+            message = body
+            try:
+                error_data = json.loads(body)
+                message = error_data.get("error", {}).get("message") or body
+            except json.JSONDecodeError:
+                pass
+
+            if attempt < AI_REQUEST_MAX_ATTEMPTS and is_retryable_http_status(exc.code):
+                app.logger.warning(
+                    "AI request retrying capability=%s path=%s attempt=%s status=%s message=%s",
+                    capability,
+                    path,
+                    attempt,
+                    exc.code,
+                    summarize_log_text(message, limit=240)
+                )
+                time.sleep(get_ai_retry_delay(attempt))
+                continue
+
+            app.logger.error(
+                "AI request failed capability=%s path=%s status=%s message=%s attempts=%s",
+                capability,
+                path,
+                exc.code,
+                summarize_log_text(message, limit=240),
+                attempt
+            )
+            raise RuntimeError(f"OpenAI 请求失败: {message}") from exc
+        except Exception as exc:
+            if attempt < AI_REQUEST_MAX_ATTEMPTS and is_retryable_ai_exception(exc):
+                app.logger.warning(
+                    "AI network request retrying capability=%s path=%s attempt=%s error=%s",
+                    capability,
+                    path,
+                    attempt,
+                    exc
+                )
+                time.sleep(get_ai_retry_delay(attempt))
+                continue
+
+            app.logger.error(
+                "AI network request failed capability=%s path=%s attempts=%s error=%s",
+                capability,
+                path,
+                attempt,
+                exc
+            )
+            raise RuntimeError(normalize_ai_exception_message(exc, capability=capability, attempts=attempt)) from exc
 
 
 def extract_chat_completion_text(response_data):
@@ -2377,20 +2552,45 @@ def generate_ai_image_with_gemini_sdk(prompt_text, model_name, api_key):
         raise RuntimeError("未配置 Gemini API Key，图片生成不可用")
 
     client = google_genai.Client(api_key=api_key)
-    response = client.models.generate_content(
-        model=model_name,
-        contents=prompt_text,
-        config=google_genai_types.GenerateContentConfig(
-            response_modalities=["IMAGE"],
-            image_config=google_genai_types.ImageConfig(
-                aspect_ratio="16:9"
+    last_exc = None
+
+    for attempt in range(1, AI_REQUEST_MAX_ATTEMPTS + 1):
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt_text,
+                config=google_genai_types.GenerateContentConfig(
+                    response_modalities=["IMAGE"],
+                    image_config=google_genai_types.ImageConfig(
+                        aspect_ratio="16:9"
+                    )
+                )
             )
-        )
-    )
-    return extract_generated_image_from_gemini_response(response)
+            return extract_generated_image_from_gemini_response(response)
+        except Exception as exc:
+            last_exc = exc
+            if attempt < AI_REQUEST_MAX_ATTEMPTS and is_retryable_ai_exception(exc):
+                app.logger.warning(
+                    "Gemini image request retrying model=%s attempt=%s error=%s",
+                    model_name,
+                    attempt,
+                    exc
+                )
+                time.sleep(get_ai_retry_delay(attempt))
+                continue
+
+            app.logger.error(
+                "Gemini image request failed model=%s attempts=%s error=%s",
+                model_name,
+                attempt,
+                exc
+            )
+            raise RuntimeError(normalize_ai_exception_message(exc, capability="image", attempts=attempt)) from exc
+
+    raise RuntimeError(normalize_ai_exception_message(last_exc, capability="image", attempts=AI_REQUEST_MAX_ATTEMPTS))
 
 
-def generate_ai_image_from_prompt(prompt_text, ai_config=None):
+def generate_ai_image_from_prompt(prompt_text, ai_config=None, public_base_url=None):
     """根据已整理好的提示词生成单张图片。"""
     config = sanitize_ai_config(ai_config)
     image_model = config["image"]["model"]
@@ -2404,7 +2604,7 @@ def generate_ai_image_from_prompt(prompt_text, ai_config=None):
         image_bytes = base64.b64decode(image_base64)
         filename = save_generated_image_bytes(image_bytes, mime_type)
         return {
-            "image_url": build_public_url("share_image_file", filename=filename),
+            "image_url": build_public_url("share_image_file", filename=filename, public_base_url=public_base_url),
             "revised_prompt": revised_prompt
         }
 
@@ -2420,12 +2620,12 @@ def generate_ai_image_from_prompt(prompt_text, ai_config=None):
     image_bytes = base64.b64decode(image_base64)
     filename = save_generated_image_bytes(image_bytes, "image/png")
     return {
-        "image_url": build_public_url("share_image_file", filename=filename),
+        "image_url": build_public_url("share_image_file", filename=filename, public_base_url=public_base_url),
         "revised_prompt": revised_prompt
     }
 
 
-def generate_ai_image(md_text, focus_prompt="", ai_config=None):
+def generate_ai_image(md_text, focus_prompt="", ai_config=None, public_base_url=None):
     """为文章生成配图。"""
     context = build_article_context(md_text, limit=2600)
     prompt_parts = [
@@ -2438,24 +2638,61 @@ def generate_ai_image(md_text, focus_prompt="", ai_config=None):
     if focus_prompt:
         prompt_parts.append(f"额外侧重点：{focus_prompt.strip()}")
 
-    return generate_ai_image_from_prompt("\n".join(prompt_parts), ai_config=ai_config)
+    return generate_ai_image_from_prompt("\n".join(prompt_parts), ai_config=ai_config, public_base_url=public_base_url)
 
 
-def illustrate_article_with_ai(md_text, style_key="editorial", ai_config=None):
+def illustrate_article_with_ai(md_text, style_key="editorial", ai_config=None, public_base_url=None, progress_callback=None):
     """一键为文章核心段落配图，并将 Markdown 图片语法插回原文。"""
     if not has_ai_capability(ai_config, capability="text") or not has_ai_capability(ai_config, capability="image"):
         raise RuntimeError("一键配图需要同时配置文本模型和图片模型")
 
+    if progress_callback:
+        progress_callback(
+            stage="planning",
+            message="正在分析文章并挑选最值得配图的核心段落。",
+            progress_percent=5,
+            completed_segments=0,
+            total_segments=0
+        )
+
     plan_result = generate_article_illustration_plan(md_text, style_key=style_key, ai_config=ai_config)
     generated_segments = []
+    total_segments = len(plan_result["plan_items"])
     app.logger.info(
         "Illustration generation started title=%s style=%s segments=%s",
         plan_result["article_context"]["title"],
         plan_result["style_key"],
-        len(plan_result["plan_items"])
+        total_segments
     )
 
+    if progress_callback:
+        if total_segments:
+            progress_callback(
+                stage="generating",
+                message=f"已锁定 {total_segments} 个核心段落，开始生成第 1 张配图。",
+                progress_percent=15,
+                completed_segments=0,
+                total_segments=total_segments,
+                style={
+                    "key": plan_result["style_key"],
+                    "label": plan_result["style_config"]["label"]
+                }
+            )
+        else:
+            progress_callback(
+                stage="completed",
+                message="这次没有识别到适合自动配图的核心段落。",
+                progress_percent=100,
+                completed_segments=0,
+                total_segments=0,
+                style={
+                    "key": plan_result["style_key"],
+                    "label": plan_result["style_config"]["label"]
+                }
+            )
+
     for plan_item in plan_result["plan_items"]:
+        current_index = len(generated_segments)
         block = plan_result["candidate_map"][plan_item["block_index"]]
         app.logger.info(
             "Generating illustration block_index=%s alt=%s preview=%s",
@@ -2469,7 +2706,30 @@ def illustrate_article_with_ai(md_text, style_key="editorial", ai_config=None):
             plan_item["prompt"],
             plan_result["style_config"]
         )
-        image_result = generate_ai_image_from_prompt(prompt_text, ai_config=ai_config)
+        if progress_callback:
+            current_number = current_index + 1
+            progress_callback(
+                stage="generating",
+                message=f"正在生成第 {current_number}/{total_segments} 张配图：{plan_item['alt_text']}",
+                progress_percent=min(90, 15 + int((current_index / max(total_segments, 1)) * 75)),
+                completed_segments=current_index,
+                total_segments=total_segments,
+                segments=generated_segments,
+                current_segment={
+                    "block_index": plan_item["block_index"],
+                    "alt_text": plan_item["alt_text"],
+                    "block_preview": summarize_markdown_block(block["content"], limit=80)
+                },
+                style={
+                    "key": plan_result["style_key"],
+                    "label": plan_result["style_config"]["label"]
+                }
+            )
+        image_result = generate_ai_image_from_prompt(
+            prompt_text,
+            ai_config=ai_config,
+            public_base_url=public_base_url
+        )
         generated_segments.append({
             "block_index": plan_item["block_index"],
             "alt_text": plan_item["alt_text"],
@@ -2481,6 +2741,33 @@ def illustrate_article_with_ai(md_text, style_key="editorial", ai_config=None):
             "Illustration generated block_index=%s image_url=%s",
             plan_item["block_index"],
             image_result["image_url"]
+        )
+        if progress_callback:
+            progress_callback(
+                stage="generating",
+                message=f"已完成 {len(generated_segments)}/{total_segments} 张配图。",
+                progress_percent=min(90, 15 + int((len(generated_segments) / max(total_segments, 1)) * 75)),
+                completed_segments=len(generated_segments),
+                total_segments=total_segments,
+                segments=generated_segments,
+                style={
+                    "key": plan_result["style_key"],
+                    "label": plan_result["style_config"]["label"]
+                }
+            )
+
+    if progress_callback:
+        progress_callback(
+            stage="writing",
+            message="正在把图片 Markdown 插回正文。",
+            progress_percent=95,
+            completed_segments=len(generated_segments),
+            total_segments=total_segments,
+            segments=generated_segments,
+            style={
+                "key": plan_result["style_key"],
+                "label": plan_result["style_config"]["label"]
+            }
         )
 
     updated_markdown = insert_images_into_markdown_blocks(
@@ -2502,6 +2789,74 @@ def illustrate_article_with_ai(md_text, style_key="editorial", ai_config=None):
             "label": plan_result["style_config"]["label"]
         }
     }
+
+
+def run_article_illustration_job(job_id, md_text, style_key, ai_config, public_base_url):
+    """后台执行一键配图任务，并持续刷新进度。"""
+    update_illustration_job(
+        job_id,
+        status="running",
+        stage="planning",
+        message="任务已启动，正在分析文章结构。",
+        progress_percent=3,
+        completed_segments=0,
+        total_segments=0,
+        error=""
+    )
+
+    def report_progress(stage, message, progress_percent=None, completed_segments=None, total_segments=None, segments=None, style=None, current_segment=None):
+        update_illustration_job(
+            job_id,
+            status="running",
+            stage=stage,
+            message=message,
+            progress_percent=progress_percent,
+            completed_segments=completed_segments,
+            total_segments=total_segments,
+            segments=copy.deepcopy(segments) if segments is not None else None,
+            style=copy.deepcopy(style) if style is not None else None,
+            current_segment=copy.deepcopy(current_segment) if current_segment is not None else None
+        )
+
+    try:
+        with app.app_context():
+            with app.test_request_context(base_url=public_base_url):
+                result = illustrate_article_with_ai(
+                    md_text,
+                    style_key=style_key,
+                    ai_config=ai_config,
+                    public_base_url=public_base_url,
+                    progress_callback=report_progress
+                )
+        update_illustration_job(
+            job_id,
+            status="succeeded",
+            stage="completed",
+            message=f"配图完成，已插入 {len(result['segments'])} 张图片。",
+            progress_percent=100,
+            completed_segments=len(result["segments"]),
+            total_segments=len(result["segments"]),
+            segments=copy.deepcopy(result["segments"]),
+            markdown=result["markdown"],
+            style=copy.deepcopy(result["style"]),
+            current_segment=None,
+            error=""
+        )
+        app.logger.info(
+            "Illustrate article job succeeded job_id=%s inserted_segments=%s",
+            job_id,
+            len(result["segments"])
+        )
+    except Exception as exc:
+        update_illustration_job(
+            job_id,
+            status="failed",
+            stage="failed",
+            message="一键配图失败。",
+            error=str(exc),
+            current_segment=None
+        )
+        app.logger.exception("Illustrate article job failed job_id=%s", job_id)
 
 
 def highlight_code(code, language, style_name):
@@ -3627,7 +3982,7 @@ def api_ai_generate_image():
 
 @app.route('/api/ai/illustrate-article', methods=['POST'])
 def api_ai_illustrate_article():
-    """一键为文章核心段落配图。"""
+    """创建一键为文章核心段落配图的后台任务。"""
     try:
         data = get_ai_request_data()
         md_text = data.get('markdown', '')
@@ -3643,18 +3998,24 @@ def api_ai_illustrate_article():
         if not has_ai_capability(ai_config, capability='text') or not has_ai_capability(ai_config, capability='image'):
             return jsonify({'success': False, 'error': '一键配图需要同时配置文本模型和图片模型'}), 400
 
-        result = illustrate_article_with_ai(md_text, style_key=style_key, ai_config=ai_config)
+        public_base_url = get_public_base_url()
+        job = create_illustration_job(style_key, public_base_url=public_base_url)
+        worker = threading.Thread(
+            target=run_article_illustration_job,
+            args=(job['job_id'], md_text, style_key, ai_config, public_base_url),
+            daemon=True
+        )
+        worker.start()
         app.logger.info(
-            "Illustrate article API succeeded style=%s inserted_segments=%s",
+            "Illustrate article job created style=%s job_id=%s",
             style_key,
-            len(result['segments'])
+            job['job_id']
         )
         return jsonify({
             'success': True,
-            'markdown': result['markdown'],
-            'segments': result['segments'],
-            'style': result['style']
-        })
+            'job_id': job['job_id'],
+            'job': serialize_illustration_job(job)
+        }), 202
     except AIConfigCryptoError as exc:
         return jsonify({
             'success': False,
@@ -3666,6 +4027,22 @@ def api_ai_illustrate_article():
             'success': False,
             'error': str(e)
         }), 500
+
+
+@app.route('/api/ai/illustrate-article/<job_id>', methods=['GET'])
+def api_ai_illustrate_article_status(job_id):
+    """查询一键配图后台任务状态。"""
+    job = get_illustration_job(job_id)
+    if not job:
+        return jsonify({
+            'success': False,
+            'error': '任务不存在或已过期'
+        }), 404
+
+    return jsonify({
+        'success': True,
+        'job': serialize_illustration_job(job)
+    })
 
 
 @app.route('/api/themes', methods=['GET'])

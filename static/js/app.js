@@ -54,6 +54,7 @@ class MD2WE {
         this.selectionSyncFrame = null;
         this.editorDragSelection = null;
         this.aiCryptoPublicKeyPromise = null;
+        this.activeIllustrationJobId = '';
         this.init();
     }
 
@@ -2314,6 +2315,61 @@ ${html}
         return data;
     }
 
+    async fetchIllustrationJob(jobId) {
+        const response = await fetch(`/api/ai/illustrate-article/${encodeURIComponent(jobId)}`);
+        const data = await response.json();
+        if (!response.ok || !data.success) {
+            throw new Error(data.error || '读取配图进度失败');
+        }
+        return data.job || null;
+    }
+
+    wait(ms) {
+        return new Promise((resolve) => {
+            window.setTimeout(resolve, ms);
+        });
+    }
+
+    getIllustrationStageLabel(stage) {
+        const stageLabels = {
+            queued: '排队中',
+            planning: '分析段落',
+            generating: '生成图片',
+            writing: '写回正文',
+            completed: '已完成',
+            failed: '失败'
+        };
+        return stageLabels[stage] || '处理中';
+    }
+
+    getIllustrationStatusLabel(status) {
+        const statusLabels = {
+            queued: '等待启动',
+            running: '处理中',
+            succeeded: '完成',
+            failed: '失败'
+        };
+        return statusLabels[status] || '处理中';
+    }
+
+    async pollIllustrationJob(jobId) {
+        while (this.activeIllustrationJobId === jobId) {
+            const job = await this.fetchIllustrationJob(jobId);
+            this.renderArticleIllustrationProgress(job);
+
+            if (job.status === 'succeeded') {
+                return job;
+            }
+            if (job.status === 'failed') {
+                throw new Error(job.error || '一键配图失败');
+            }
+
+            await this.wait(1500);
+        }
+
+        throw new Error('配图任务已被新的请求替换');
+    }
+
     async buildAIConfigTransportPayload() {
         const aiConfig = this.getAIConfigPayload();
         if (!CONFIG.aiCrypto?.enabled) {
@@ -2542,22 +2598,189 @@ ${html}
     }
 
     async illustrateArticleWithAI() {
-        this.articleIllustrationResult.className = 'assistant-card-body muted';
-        this.articleIllustrationResult.textContent = '正在提取核心段落并批量生成配图，请稍候...';
+        this.activeIllustrationJobId = '';
+        this.renderArticleIllustrationProgress({
+            status: 'queued',
+            stage: 'queued',
+            message: '正在提交一键配图任务。',
+            progress_percent: 1,
+            completed_segments: 0,
+            total_segments: 0,
+            segments: [],
+            style: {
+                key: this.articleIllustrationStyleSelect.value || this.getDefaultIllustrationStyle(),
+                label: this.articleIllustrationStyleSelect.selectedOptions?.[0]?.textContent || '当前画风'
+            }
+        });
 
-        const data = await this.callAIEndpoint('/api/ai/illustrate-article', {
+        const createData = await this.callAIEndpoint('/api/ai/illustrate-article', {
             markdown: this.editor.value,
             style: this.articleIllustrationStyleSelect.value || this.getDefaultIllustrationStyle()
         });
+        const jobId = createData.job_id;
+        this.activeIllustrationJobId = jobId;
 
-        this.editor.value = data.markdown || this.editor.value;
+        if (createData.job) {
+            this.renderArticleIllustrationProgress(createData.job);
+        }
+
+        const job = await this.pollIllustrationJob(jobId);
+
+        this.editor.value = job.markdown || this.editor.value;
         this.saveContent();
         this.invalidateShareState();
         this.updateStats();
         this.updateEditorSyntax();
         this.updatePreview();
-        this.renderArticleIllustrationResult(data);
-        this.showToast(`已插入 ${data.segments?.length || 0} 张配图`, 'success');
+        this.renderArticleIllustrationResult({
+            markdown: job.markdown,
+            segments: job.segments,
+            style: job.style,
+            summary_message: job.message
+        });
+        this.showToast(`已插入 ${job.segments?.length || 0} 张配图`, 'success');
+    }
+
+    renderArticleIllustrationProgress(job) {
+        if (!job) {
+            this.articleIllustrationResult.className = 'assistant-card-body muted';
+            this.articleIllustrationResult.textContent = '配图任务状态不可用。';
+            return;
+        }
+
+        if (job.status === 'succeeded') {
+            this.renderArticleIllustrationResult({
+                markdown: job.markdown,
+                segments: job.segments,
+                style: job.style,
+                summary_message: job.message
+            });
+            return;
+        }
+
+        if (job.status === 'failed') {
+            const wrapper = document.createElement('div');
+            wrapper.className = 'illustration-progress-shell is-failed';
+
+            const header = document.createElement('div');
+            header.className = 'illustration-progress-header';
+
+            const headerCopy = document.createElement('div');
+            const kicker = document.createElement('div');
+            kicker.className = 'illustration-progress-kicker';
+            kicker.textContent = '一键配图失败';
+            const title = document.createElement('div');
+            title.className = 'illustration-progress-title';
+            title.textContent = this.getIllustrationStageLabel(job.stage || 'failed');
+            headerCopy.appendChild(kicker);
+            headerCopy.appendChild(title);
+
+            const badge = document.createElement('span');
+            badge.className = 'illustration-progress-badge is-failed';
+            badge.textContent = this.getIllustrationStatusLabel(job.status);
+
+            header.appendChild(headerCopy);
+            header.appendChild(badge);
+
+            const message = document.createElement('div');
+            message.className = 'illustration-progress-message';
+            message.textContent = job.error || job.message || '请稍后重试';
+
+            wrapper.appendChild(header);
+            wrapper.appendChild(message);
+            this.articleIllustrationResult.className = 'assistant-card-body';
+            this.articleIllustrationResult.innerHTML = '';
+            this.articleIllustrationResult.appendChild(wrapper);
+            return;
+        }
+
+        const percent = Math.max(0, Math.min(100, Number(job.progress_percent) || 0));
+        const completedSegments = Number(job.completed_segments) || 0;
+        const totalSegments = Number(job.total_segments) || 0;
+        const segments = Array.isArray(job.segments) ? job.segments : [];
+        const currentSegment = job.current_segment || null;
+        const wrapper = document.createElement('div');
+        wrapper.className = 'illustration-progress-shell';
+
+        const header = document.createElement('div');
+        header.className = 'illustration-progress-header';
+
+        const headerCopy = document.createElement('div');
+        const kicker = document.createElement('div');
+        kicker.className = 'illustration-progress-kicker';
+        kicker.textContent = job.style?.label ? `一键配图 · ${job.style.label}` : '一键配图';
+        const title = document.createElement('div');
+        title.className = 'illustration-progress-title';
+        title.textContent = this.getIllustrationStageLabel(job.stage);
+        headerCopy.appendChild(kicker);
+        headerCopy.appendChild(title);
+
+        const badge = document.createElement('span');
+        badge.className = 'illustration-progress-badge';
+        badge.textContent = this.getIllustrationStatusLabel(job.status);
+
+        header.appendChild(headerCopy);
+        header.appendChild(badge);
+
+        const progressMeta = document.createElement('div');
+        progressMeta.className = 'illustration-progress-meta';
+        progressMeta.textContent = totalSegments
+            ? `已完成 ${completedSegments}/${totalSegments} 张`
+            : '正在准备本次任务';
+
+        const track = document.createElement('div');
+        track.className = 'illustration-progress-track';
+        const fill = document.createElement('div');
+        fill.className = 'illustration-progress-fill';
+        fill.style.width = `${percent}%`;
+        track.appendChild(fill);
+
+        const message = document.createElement('div');
+        message.className = 'illustration-progress-message';
+        message.textContent = job.message || '正在处理中...';
+
+        wrapper.appendChild(header);
+        wrapper.appendChild(progressMeta);
+        wrapper.appendChild(track);
+        wrapper.appendChild(message);
+
+        if (segments.length || currentSegment) {
+            const list = document.createElement('div');
+            list.className = 'illustration-result-list';
+
+            segments.forEach((segment) => {
+                list.appendChild(this.createIllustrationSegmentCard(segment, false));
+            });
+
+            if (currentSegment && !segments.some((segment) => segment.block_index === currentSegment.block_index)) {
+                list.appendChild(this.createIllustrationSegmentCard(currentSegment, true));
+            }
+
+            wrapper.appendChild(list);
+        }
+
+        this.articleIllustrationResult.className = 'assistant-card-body';
+        this.articleIllustrationResult.innerHTML = '';
+        this.articleIllustrationResult.appendChild(wrapper);
+    }
+
+    createIllustrationSegmentCard(segment, isPending = false) {
+        const item = document.createElement('div');
+        item.className = `illustration-result-item${isPending ? ' is-pending' : ''}`;
+
+        const meta = document.createElement('div');
+        meta.className = 'illustration-result-meta';
+        meta.textContent = isPending
+            ? `进行中 · 段落 ${segment.block_index} · ${segment.alt_text || 'AI 配图'}`
+            : `段落 ${segment.block_index} · ${segment.alt_text || 'AI 配图'}`;
+
+        const preview = document.createElement('div');
+        preview.className = 'illustration-result-preview';
+        preview.textContent = segment.block_preview || (isPending ? '正在生成当前段落的插画。' : '');
+
+        item.appendChild(meta);
+        item.appendChild(preview);
+        return item;
     }
 
     renderArticleIllustrationResult(data) {
@@ -2573,24 +2796,11 @@ ${html}
 
         const summary = document.createElement('div');
         summary.className = 'illustration-result-summary';
-        summary.textContent = `已按 ${data.style?.label || '当前画风'} 自动插入 ${segments.length} 张配图。只保留核心段落，最多 5 个。`;
+        summary.textContent = data.summary_message || `已按 ${data.style?.label || '当前画风'} 自动插入 ${segments.length} 张配图。只保留核心段落，最多 5 个。`;
         wrapper.appendChild(summary);
 
         segments.forEach((segment) => {
-            const item = document.createElement('div');
-            item.className = 'illustration-result-item';
-
-            const meta = document.createElement('div');
-            meta.className = 'illustration-result-meta';
-            meta.textContent = `段落 ${segment.block_index} · ${segment.alt_text || 'AI 配图'}`;
-
-            const preview = document.createElement('div');
-            preview.className = 'illustration-result-preview';
-            preview.textContent = segment.block_preview || '';
-
-            item.appendChild(meta);
-            item.appendChild(preview);
-            wrapper.appendChild(item);
+            wrapper.appendChild(this.createIllustrationSegmentCard(segment, false));
         });
 
         this.articleIllustrationResult.className = 'assistant-card-body';
@@ -2668,7 +2878,7 @@ ${html}
         this.summaryOutput.className = 'assistant-card-body muted';
         this.summaryOutput.textContent = '点击“一键摘要”生成适合文章导语、封面说明或摘要栏的文案。';
         this.articleIllustrationResult.className = 'assistant-card-body muted';
-        this.articleIllustrationResult.textContent = '只抽取核心段落，最多 5 个，生成后会直接插入正文。';
+        this.articleIllustrationResult.textContent = '只抽取核心段落，最多 5 个。执行后会显示实时进度，并在完成后直接插入正文。';
         this.generatedImageState.className = 'assistant-card-body muted';
         this.generatedImageState.textContent = '尚未生成配图。';
         this.generatedImagePanel.classList.add('hidden');

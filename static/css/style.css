@@ -949,6 +949,93 @@ body.drawer-open {
     gap: 12px;
 }
 
+.illustration-progress-shell {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 14px;
+    border-radius: 16px;
+    border: 1px solid rgba(11, 75, 145, 0.14);
+    background:
+        radial-gradient(circle at top right, rgba(25, 194, 200, 0.14), transparent 32%),
+        linear-gradient(180deg, rgba(7, 29, 66, 0.035), rgba(255, 255, 255, 0.92));
+}
+
+.illustration-progress-shell.is-failed {
+    border-color: rgba(185, 28, 28, 0.16);
+    background:
+        radial-gradient(circle at top right, rgba(239, 68, 68, 0.12), transparent 34%),
+        linear-gradient(180deg, rgba(127, 29, 29, 0.03), rgba(255, 255, 255, 0.94));
+}
+
+.illustration-progress-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+}
+
+.illustration-progress-kicker {
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: #4c6a92;
+    font-weight: 700;
+}
+
+.illustration-progress-title {
+    margin-top: 3px;
+    color: #10243f;
+    font-size: 16px;
+    font-weight: 700;
+    line-height: 1.3;
+}
+
+.illustration-progress-badge {
+    flex-shrink: 0;
+    padding: 6px 10px;
+    border-radius: 999px;
+    background: rgba(0, 102, 255, 0.1);
+    color: #174075;
+    font-size: 11px;
+    font-weight: 700;
+}
+
+.illustration-progress-badge.is-failed {
+    background: rgba(220, 38, 38, 0.12);
+    color: #991b1b;
+}
+
+.illustration-progress-meta {
+    color: #32527a;
+    font-size: 12px;
+    font-weight: 600;
+}
+
+.illustration-progress-track {
+    position: relative;
+    overflow: hidden;
+    width: 100%;
+    height: 10px;
+    border-radius: 999px;
+    background: rgba(15, 39, 68, 0.08);
+}
+
+.illustration-progress-fill {
+    position: relative;
+    height: 100%;
+    border-radius: inherit;
+    background: linear-gradient(90deg, #0f68dc 0%, #19c2c8 100%);
+    box-shadow: 0 0 24px rgba(15, 104, 220, 0.2);
+    transition: width 280ms ease;
+}
+
+.illustration-progress-message {
+    color: var(--text-secondary);
+    font-size: 12px;
+    line-height: 1.65;
+}
+
 .illustration-result-list {
     display: flex;
     flex-direction: column;
@@ -965,6 +1052,12 @@ body.drawer-open {
     border-radius: 12px;
     border: 1px solid rgba(0, 102, 255, 0.1);
     background: rgba(0, 102, 255, 0.04);
+}
+
+.illustration-result-item.is-pending {
+    border-style: dashed;
+    border-color: rgba(12, 74, 110, 0.18);
+    background: rgba(15, 104, 220, 0.03);
 }
 
 .illustration-result-meta {
